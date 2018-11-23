@@ -349,6 +349,8 @@ declare namespace Taro {
 
     options?: ComponentOptions;
 
+    $componentType: 'PAGE' | 'COMPONENT'
+
     $router: {
       params: any
     }
@@ -420,6 +422,9 @@ declare namespace Taro {
   function getEnv(): ENV_TYPE.WEAPP | ENV_TYPE.WEB | ENV_TYPE.RN;
 
   function render(component: Component | JSX.Element, element: Element | null)
+
+  function internal_safe_set (...arg): any
+  function internal_safe_get (...arg): any
 
   function pxTransform(size: number): string
 

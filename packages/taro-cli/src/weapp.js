@@ -10,11 +10,18 @@ const t = require('babel-types')
 const generate = require('babel-generator').default
 const template = require('babel-template')
 const autoprefixer = require('autoprefixer')
+const minimatch = require('minimatch')
+const _ = require('lodash')
+
 const postcss = require('postcss')
 const pxtransform = require('postcss-pxtransform')
 const cssUrlParse = require('postcss-url')
-const minimatch = require('minimatch')
-const _ = require('lodash')
+const Scope = require('postcss-modules-scope')
+const Values = require('postcss-modules-values')
+const genericNames = require('generic-names')
+const LocalByDefault = require('postcss-modules-local-by-default')
+const ExtractImports = require('postcss-modules-extract-imports')
+const ResolveImports = require('postcss-modules-resolve-imports')
 
 const Util = require('./util')
 const CONFIG = require('./config')
@@ -98,6 +105,9 @@ function getExactedNpmFilePath (npmName, filePath) {
         const npmFilePath = npmInfoMainPath.replace(NODE_MODULES_REG, '')
         outputNpmPath = path.join(path.resolve(configDir, '..', weappNpmConfig.dir), weappNpmConfig.name, npmFilePath)
       }
+    }
+    if (buildAdapter === Util.BUILD_TYPES.ALIPAY) {
+      outputNpmPath = outputNpmPath.replace(/@/, '_')
     }
     const relativePath = path.relative(filePath, outputNpmPath)
     return Util.promoteRelativePath(relativePath)
@@ -366,6 +376,7 @@ function parseAst (type, ast, depComponents, sourceFilePath, filePath, npmSkip =
       const node = astPath.node
       const source = node.source
       let value = source.value
+      const specifiers = node.specifiers
       if (Util.isNpmPkg(value) && notExistNpmList.indexOf(value) < 0) {
         if (value === taroJsComponents) {
           astPath.remove()
@@ -409,6 +420,42 @@ function parseAst (type, ast, depComponents, sourceFilePath, filePath, npmSkip =
               source.value = value
             }
           }
+        }
+      } else if (Util.CSS_EXT.indexOf(path.extname(value)) !== -1 && specifiers.length > 0) { // 对 使用 import style from './style.css' 语法引入的做转化处理
+        Util.printLog(Util.pocessTypeEnum.GENERATE, '替换代码', `为文件 ${sourceFilePath} 生成 css modules`)
+        const styleFilePath = path.join(path.dirname(sourceFilePath), value)
+        const styleCode = fs.readFileSync(styleFilePath).toString()
+        const result = processStyleUseCssModule({
+          css: styleCode,
+          filePath: styleFilePath
+        })
+        const tokens = result.root.exports || {}
+        const objectPropperties = []
+        for (const key in tokens) {
+          if (tokens.hasOwnProperty(key)) {
+            objectPropperties.push(t.objectProperty(t.identifier(key), t.stringLiteral(tokens[key])))
+          }
+        }
+        let defaultDeclator = null
+        let normalDeclator = null
+        let importItems = []
+        specifiers.forEach(s => {
+          if (t.isImportDefaultSpecifier(s)) {
+            defaultDeclator = [t.variableDeclarator(t.identifier(s.local.name), t.objectExpression(objectPropperties))]
+          } else {
+            importItems.push(t.objectProperty(t.identifier(s.local.name), t.identifier(s.local.name)))
+          }
+        })
+        normalDeclator = [t.variableDeclarator(t.objectPattern(importItems), t.objectExpression(objectPropperties))]
+        if (defaultDeclator) {
+          astPath.insertBefore(t.variableDeclaration('const', defaultDeclator))
+        }
+        if (normalDeclator) {
+          astPath.insertBefore(t.variableDeclaration('const', normalDeclator))
+        }
+        astPath.remove()
+        if (styleFiles.indexOf(styleFilePath) < 0) { // add this css file to queue
+          styleFiles.push(styleFilePath)
         }
       } else if (path.isAbsolute(value)) {
         Util.printLog(Util.pocessTypeEnum.ERROR, '引用文件', `文件 ${sourceFilePath} 中引用 ${value} 是绝对路径！`)
@@ -472,8 +519,26 @@ function parseAst (type, ast, depComponents, sourceFilePath, filePath, npmSkip =
               }
             }
           }
-        }
-        if (path.isAbsolute(value)) {
+        } else if (Util.CSS_EXT.indexOf(path.extname(value)) !== -1 && t.isVariableDeclarator(astPath.parentPath)) { // 对 使用 const style = require('./style.css') 语法引入的做转化处理
+          Util.printLog(Util.pocessTypeEnum.GENERATE, '替换代码', `为文件 ${sourceFilePath} 生成 css modules`)
+          const styleFilePath = path.join(path.dirname(sourceFilePath), value)
+          const styleCode = fs.readFileSync(styleFilePath).toString()
+          const result = processStyleUseCssModule({
+            css: styleCode,
+            filePath: styleFilePath
+          })
+          const tokens = result.root.exports || {}
+          const objectPropperties = []
+          for (const key in tokens) {
+            if (tokens.hasOwnProperty(key)) {
+              objectPropperties.push(t.objectProperty(t.identifier(key), t.stringLiteral(tokens[key])))
+            }
+          }
+          astPath.replaceWith(t.objectExpression(objectPropperties))
+          if (styleFiles.indexOf(styleFilePath) < 0) { // add this css file to queue
+            styleFiles.push(styleFilePath)
+          }
+        } else if (path.isAbsolute(value)) {
           Util.printLog(Util.pocessTypeEnum.ERROR, '引用文件', `文件 ${sourceFilePath} 中引用 ${value} 是绝对路径！`)
         }
       }
@@ -1127,6 +1192,16 @@ function transfromNativeComponents (configFile, componentConfig) {
         const componentJSON = require(componentJSONPath)
         const outputComponentJSONPath = outputComponentJSPath.replace(path.extname(outputComponentJSPath), outputFilesTypes.CONFIG)
         copyFileSync(componentJSONPath, outputComponentJSONPath)
+
+        // 解决组件循环依赖不断编译爆栈的问题
+        if (componentJSON && componentJSON.usingComponents) {
+          Object.keys(componentJSON.usingComponents).forEach(key => {
+            if (key === item) {
+              delete componentJSON.usingComponents[key]
+            }
+          })
+        }
+
         transfromNativeComponents(componentJSONPath, componentJSON)
       }
     })
@@ -1280,14 +1355,60 @@ async function buildSinglePage (page) {
   }
 }
 
+/**
+ * css module processor
+ * @param styleObj { css: string, filePath: '' }
+ * @returns postcss.process()
+ */
+function processStyleUseCssModule (styleObj) {
+  // 对 xxx.global.[css|scss|less|styl] 等样式文件不做处理
+  const DO_NOT_USE_CSS_MODULE = '.global'
+  if (styleObj.filePath.indexOf(DO_NOT_USE_CSS_MODULE) > -1) return styleObj
+  const useModuleConf = weappConf.module || {}
+  const customPostcssConf = useModuleConf.postcss || {}
+  const customCssModulesConf = Object.assign({
+    enable: false,
+    config: {
+      generateScopedName: '[name]__[local]___[hash:base64:5]'
+    }
+  }, customPostcssConf.cssModules || {})
+  if (!customCssModulesConf.enable) {
+    return styleObj
+  }
+  const generateScopedName = customCssModulesConf.generateScopedName
+  const context = process.cwd()
+  let scopedName
+  if (generateScopedName) {
+    scopedName = genericNames(generateScopedName, { context })
+  } else {
+    scopedName = (local, filename) => Scope.generateScopedName(local, path.relative(context, filename))
+  }
+  const postcssPlugins = [
+    Values,
+    LocalByDefault,
+    ExtractImports,
+    new Scope({ generateScopedName: scopedName }),
+    new ResolveImports({ resolve: Object.assign({}, { extensions: Util.CSS_EXT }) }),
+  ]
+  const runner = postcss(postcssPlugins)
+  const result = runner.process(styleObj.css, Object.assign({}, { from: styleObj.filePath }))
+  return result
+}
+
 async function processStyleWithPostCSS (styleObj) {
   const useModuleConf = weappConf.module || {}
   const customPostcssConf = useModuleConf.postcss || {}
-  const customPxtransformConf =  Object.assign({
+  const customCssModulesConf = Object.assign({
+    enable: false,
+    config: {
+      generateScopedName: '[name]__[local]___[hash:base64:5]'
+    }
+  }, customPostcssConf.cssModules || {})
+  const customPxtransformConf = Object.assign({
     enable: true,
     config: {}
   }, customPostcssConf.pxtransform || {})
-  const customUrlConf =  Object.assign({
+  const customUrlConf = Object.assign({
     enable: true,
     config: {
       limit: 10240
@@ -1325,7 +1446,7 @@ async function processStyleWithPostCSS (styleObj) {
     }))
   }
 
-  const defaultPostCSSPluginNames = ['autoprefixer', 'pxtransform', 'url']
+  const defaultPostCSSPluginNames = ['autoprefixer', 'pxtransform', 'url', 'cssModules']
   Object.keys(customPostcssConf).forEach(pluginName => {
     if (defaultPostCSSPluginNames.indexOf(pluginName) < 0) {
       const pluginConf = customPostcssConf[pluginName]
@@ -1337,7 +1458,11 @@ async function processStyleWithPostCSS (styleObj) {
       }
     }
   })
-  const postcssResult = await postcss(processors).process(styleObj.css, {
+  let css = styleObj.css
+  if (customCssModulesConf.enable) {
+    css = processStyleUseCssModule(styleObj).css
+  }
+  const postcssResult = await postcss(processors).process(css, {
     from: styleObj.filePath
   })
   return postcssResult.css
@@ -1745,7 +1870,7 @@ function copyFiles () {
         if (fs.existsSync(from)) {
           const copyOptions = {}
           if (ignore) {
-            ignore = Array.isArray(ignore) || [ignore]
+            ignore = Array.isArray(ignore) ? ignore : [ignore]
             copyOptions.filter = src => {
               let isMatch = false
               ignore.forEach(iPa => {

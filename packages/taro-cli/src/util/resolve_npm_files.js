@@ -152,6 +152,9 @@ function recursiveRequire (filePath, files, isProduction, npmConfig = {}, buildA
     const npmFilePath = filePath.replace(/(.*)node_modules/, '')
     outputNpmPath = path.join(path.resolve(configDir, '..', npmConfig.dir), npmConfig.name, npmFilePath)
   }
+  if (buildAdapter === BUILD_TYPES.ALIPAY) {
+    outputNpmPath = outputNpmPath.replace(/@/, '_')
+  }
   if (REG_STYLE.test(path.basename(filePath))) {
     return
   }
@@ -212,6 +215,13 @@ function npmCodeHack (filePath, content, buildAdapter) {
       } else {
         content = content.replace(/Function\([\'"]return this[\'"]\)\(\)/, 'this')
       }
+      break
+    case 'mobx.js':
+      //解决支付宝小程序全局window或global不存在的问题
+      content = content.replace(
+        /typeof window\s{0,}!==\s{0,}[\'"]undefined[\'"]\s{0,}\?\s{0,}window\s{0,}:\s{0,}global/,
+        'typeof window !== "undefined" ? window : typeof global !== "undefined" ? global : {}'
+      )
       break
     case '_html.js':
       content = 'module.exports = false;'
